@@ -7,10 +7,108 @@ body {
   height: 100%;
 }
 
+html {
+  color-scheme: dark;
+}
+
 body {
   background: radial-gradient(1200px 800px at 20% 10%, rgba(34, 211, 238, 0.08), transparent 55%),
     radial-gradient(1100px 700px at 80% 20%, rgba(167, 139, 250, 0.08), transparent 55%),
     linear-gradient(180deg, #06070b, #0b0f17 35%, #06070b);
   color: white;
+  font-feature-settings: "ss01" on, "cv02" on, "cv11" on;
 }
 
+@layer base {
+  * {
+    @apply border-white/10;
+  }
+
+  body,
+  input,
+  button,
+  textarea,
+  select {
+    @apply font-sans;
+  }
+
+  ::selection {
+    background: rgba(34, 211, 238, 0.28);
+  }
+}
+
+@layer components {
+  .app-shell {
+    @apply relative isolate min-h-screen overflow-hidden;
+  }
+
+  .app-shell-scroll {
+    overflow: visible;
+  }
+
+  .app-shell-plain {
+    background: linear-gradient(180deg, #06070b, #06070b);
+  }
+
+  .app-shell::before {
+    content: "";
+    @apply pointer-events-none absolute inset-0 opacity-40;
+    background-image:
+      linear-gradient(to right, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+    background-position: center;
+    background-size: 72px 72px;
+    mask-image: radial-gradient(circle at center, black, transparent 78%);
+  }
+
+  .app-shell-plain::before {
+    opacity: 0.08;
+    background-image: none;
+    mask-image: none;
+  }
+
+  .glass-panel {
+    @apply rounded-glass border bg-white/5 shadow-glass backdrop-blur;
+  }
+
+  .glass-panel-strong {
+    @apply rounded-glass border bg-white/10 shadow-glass backdrop-blur;
+  }
+
+  .glass-inset {
+    @apply rounded-glass border bg-black/25 backdrop-blur;
+  }
+
+  .text-muted {
+    @apply text-white/60;
+  }
+
+  .text-subtle {
+    @apply text-white/40;
+  }
+
+  .ring-accent {
+    box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.18), 0 0 0 1px rgba(167, 139, 250, 0.14) inset,
+      0 24px 80px rgba(0, 0, 0, 0.55);
+  }
+
+  .accent-text {
+    @apply bg-gradient-to-r from-accent-cyan via-white to-accent-violet bg-clip-text text-transparent;
+  }
+
+  .status-dot {
+    @apply h-2.5 w-2.5 rounded-full;
+  }
+
+  .status-dot-live {
+    @apply status-dot bg-emerald-400 shadow-[0_0_18px_rgba(52,211,153,0.9)];
+  }
+
+  .status-dot-warn {
+    @apply status-dot bg-amber-400 shadow-[0_0_18px_rgba(251,191,36,0.9)];
+  }
+
+  .status-dot-down {
+    @apply status-dot bg-rose-400 shadow-[0_0_18px_rgba(251,113,133,0.9)];
+  }
+}
