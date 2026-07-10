@@ -3,53 +3,58 @@
 import * as React from "react"
 import { drawConnectors, drawLandmarks } from "@mediapipe/drawing_utils"
 import {
-  FACEMESH_FACE_OVAL,
-  FACEMESH_LEFT_EYE,
-  FACEMESH_LEFT_EYEBROW,
-  FACEMESH_LIPS,
-  FACEMESH_RIGHT_EYE,
-  FACEMESH_RIGHT_EYEBROW,
-  HAND_CONNECTIONS,
-  POSE_CONNECTIONS,
-} from "@mediapipe/holistic"
+  FaceLandmarker,
+  HandLandmarker,
+  type HandLandmarkerResult,
+  PoseLandmarker,
+} from "@mediapipe/tasks-vision"
 
-import {
-  ENGINE_DOCKER_COMMAND,
-  ENGINE_HEALTH_URL,
-  ENGINE_RECONNECT_INTERVAL_MS,
-  ENGINE_WEBSOCKET_URL,
-  FALLBACK_SNAPSHOT,
-  readSnapshot,
-} from "@/lib/engine"
 import { Button } from "@/components/ui/Button"
 import { Card, CardBody, CardTitle } from "@/components/ui/Card"
 import { useToast } from "@/components/ui/Toast"
+import { useAuth } from "@/components/providers/AuthProvider"
+import { finalizeActiveCaptureSession } from "@/lib/analytics/archiveLifecycle"
+import { appendAnalyticsSnapshot, startAnalyticsCaptureSession } from "@/lib/analytics/captureSession"
 import { useWebcameraPreview } from "@/components/dashboard/useWebcameraPreview"
+import { useClientVision, type ClientVisionLandmark } from "@/hooks/useClientVision"
 
 const CYAN = "#00BCD4"
 const ORANGE = "#FF9800"
 const WHITE = "#FFFFFF"
+const SNAPSHOT_WARMUP_MS = 5_000
+const SNAPSHOT_INTERVAL_MS = 60_000
+const POSE_FACE_INDICES = new Set(Array.from({ length: 11 }, (_, index) => index))
+
+type ConnectorDefinition = {
+  start: number
+  end: number
+}
+
+function toConnectorPairs(connections: ConnectorDefinition[]) {
+  return connections.map(({ start, end }) => [start, end] as [number, number])
+}
 
 const RIGHT_SIDE_POSE_INDICES = new Set([12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32])
-const FACE_CONTOUR_CONNECTIONS = [
-  FACEMESH_FACE_OVAL,
-  FACEMESH_LIPS,
-  FACEMESH_LEFT_EYEBROW,
-  FACEMESH_RIGHT_EYEBROW,
-  FACEMESH_LEFT_EYE,
-  FACEMESH_RIGHT_EYE,
-]
+const FACE_TESSELLATION_CONNECTIONS = toConnectorPairs(FaceLandmarker.FACE_LANDMARKS_TESSELATION)
+const FACE_CONTOUR_CONNECTIONS = toConnectorPairs(FaceLandmarker.FACE_LANDMARKS_CONTOURS)
+const HAND_CONNECTIONS = toConnectorPairs(HandLandmarker.HAND_CONNECTIONS)
+const POSE_CONNECTIONS = toConnectorPairs(PoseLandmarker.POSE_CONNECTIONS)
 
 const FACE_DOT_STYLE = {
   color: "transparent",
   fillColor: CYAN,
-  radius: 1.5,
+  radius: 1.1,
   lineWidth: 0,
+} as const
+
+const FACE_TESSELLATION_STYLE = {
+  color: "rgba(0, 188, 212, 0.34)",
+  lineWidth: 0.75,
 } as const
 
 const FACE_CONTOUR_STYLE = {
   color: WHITE,
-  lineWidth: 2,
+  lineWidth: 1.5,
 } as const
 
 const POSE_CONNECTOR_STYLE = {
@@ -76,82 +81,108 @@ const HAND_LANDMARK_STYLE = {
   radius: (data: { index?: number }) => (data.index === 0 ? 6 : 4),
 }
 
-type CanvasLandmark = {
-  x: number
-  y: number
-  z?: number
-  visibility?: number
-}
-
-type RawObservation = {
-  track_id?: string
-  domain?: "face" | "pose" | "left_hand" | "right_hand"
-  landmark_index?: number
-  x?: number
-  y?: number
-  visibility?: number | null
-}
-
-function createEmptyLandmarks(size: number) {
-  return Array.from({ length: size }, () => ({ x: 0, y: 0, z: 0, visibility: 0 }))
-}
-
-function rebuildTrackLandmarks(observations: RawObservation[], trackId: string, canvasWidth: number, canvasHeight: number) {
-  const poseLandmarks = createEmptyLandmarks(33)
-  const leftHandLandmarks = createEmptyLandmarks(21)
-  const rightHandLandmarks = createEmptyLandmarks(21)
-  const faceLandmarks = createEmptyLandmarks(468)
-
-  let hasPose = false
-  let hasLeftHand = false
-  let hasRightHand = false
-  let hasFace = false
-
-  observations.forEach((observation) => {
-    if (observation.track_id !== trackId && `track-${observation.track_id}` !== trackId) return
-    if (typeof observation.landmark_index !== "number") return
-    if (typeof observation.x !== "number" || typeof observation.y !== "number") return
-
-    const landmarkIndex = observation.landmark_index
-    const point = {
-      x: observation.x / canvasWidth,
-      y: observation.y / canvasHeight,
-      z: 0,
-      visibility: observation.visibility ?? 1,
-    }
-
-    if (observation.domain === "pose" && landmarkIndex < 33) {
-      poseLandmarks[landmarkIndex] = point
-      hasPose = true
-    } else if (observation.domain === "left_hand" && landmarkIndex < 21) {
-      leftHandLandmarks[landmarkIndex] = point
-      hasLeftHand = true
-    } else if (observation.domain === "right_hand" && landmarkIndex < 21) {
-      rightHandLandmarks[landmarkIndex] = point
-      hasRightHand = true
-    } else if (observation.domain === "face" && landmarkIndex < 468) {
-      faceLandmarks[landmarkIndex] = point
-      hasFace = true
-    }
-  })
-
-  return {
-    poseLandmarks,
-    leftHandLandmarks,
-    rightHandLandmarks,
-    faceLandmarks,
-    hasPose,
-    hasLeftHand,
-    hasRightHand,
-    hasFace,
-  }
-}
-
-function drawHandOverlay(canvasCtx: CanvasRenderingContext2D, landmarks: CanvasLandmark[]) {
+function drawHandOverlay(canvasCtx: CanvasRenderingContext2D, landmarks: ClientVisionLandmark[]) {
   if (landmarks.length === 0) return
 
   drawConnectors(canvasCtx, landmarks, HAND_CONNECTIONS, HAND_CONNECTOR_STYLE)
   drawLandmarks(canvasCtx, landmarks, HAND_LANDMARK_STYLE)
+}
+
+function isVisibleLandmark(landmark: ClientVisionLandmark | undefined, minimumVisibility = 0) {
+  return (landmark?.visibility ?? 1) > minimumVisibility
+}
+
+function normalizeRenderableLandmarks(landmarks: ClientVisionLandmark[], treatMissingVisibilityAsVisible: boolean) {
+  return landmarks.map((landmark) => ({
+    ...landmark,
+    // Face and hand tasks do not expose pose-style visibility reliably for canvas helpers.
+    visibility: treatMissingVisibilityAsVisible ? Math.max(landmark.visibility ?? 0, 1) : landmark.visibility ?? 0,
+    presence: Math.max((landmark as ClientVisionLandmark & { presence?: number }).presence ?? 0, 1),
+  }))
+}
+
+function mutePoseFaceLandmarks(landmarks: ClientVisionLandmark[]) {
+  return landmarks.map((landmark, index) => {
+    if (!POSE_FACE_INDICES.has(index)) {
+      return landmark
+    }
+
+    return {
+      ...landmark,
+      visibility: 0,
+      presence: 0,
+    }
+  })
+}
+
+function partitionHandLandmarks(handResults: HandLandmarkerResult | null) {
+  const leftHandLandmarks: ClientVisionLandmark[][] = []
+  const rightHandLandmarks: ClientVisionLandmark[][] = []
+
+  handResults?.landmarks.forEach((landmarks, index) => {
+    const handedness = handResults.handedness[index]?.[0]?.categoryName?.toLowerCase() === "left" ? "left" : "right"
+    const normalizedLandmarks = normalizeRenderableLandmarks([...landmarks], true)
+
+    if (handedness === "left") {
+      leftHandLandmarks.push(normalizedLandmarks)
+      return
+    }
+
+    rightHandLandmarks.push(normalizedLandmarks)
+  })
+
+  return { leftHandLandmarks, rightHandLandmarks }
+}
+
+function collectVisibleLandmarks({
+  faceLandmarks,
+  poseLandmarks,
+  leftHandLandmarks,
+  rightHandLandmarks,
+}: {
+  faceLandmarks: ClientVisionLandmark[]
+  poseLandmarks: ClientVisionLandmark[]
+  leftHandLandmarks: ClientVisionLandmark[][]
+  rightHandLandmarks: ClientVisionLandmark[][]
+}) {
+  return [
+    ...faceLandmarks.filter((landmark) => isVisibleLandmark(landmark)),
+    ...poseLandmarks.filter((landmark) => isVisibleLandmark(landmark, 0.35)),
+    ...leftHandLandmarks.flatMap((landmarks) => landmarks.filter((landmark) => isVisibleLandmark(landmark))),
+    ...rightHandLandmarks.flatMap((landmarks) => landmarks.filter((landmark) => isVisibleLandmark(landmark))),
+  ]
+}
+
+function renderCompositeSnapshotToJpegBlob(video: HTMLVideoElement, overlayCanvas: HTMLCanvasElement | null) {
+  const canvas = document.createElement("canvas")
+  canvas.width = video.videoWidth
+  canvas.height = video.videoHeight
+
+  const context = canvas.getContext("2d")
+  if (!context) {
+    return Promise.resolve<Blob | null>(null)
+  }
+
+  context.drawImage(video, 0, 0, canvas.width, canvas.height)
+  if (overlayCanvas) {
+    context.drawImage(overlayCanvas, 0, 0, canvas.width, canvas.height)
+  }
+
+  return new Promise<Blob | null>((resolve) => {
+    canvas.toBlob(
+      (blob) => {
+        canvas.width = 0
+        canvas.height = 0
+        resolve(blob)
+      },
+      "image/jpeg",
+      0.85
+    )
+  })
+}
+
+function formatSnapshotFileName(capturedAt: string, offsetMs: number) {
+  return `snapshot_t+${String(offsetMs).padStart(6, "0")}ms_${capturedAt.replace(/[:.]/g, "-")}.jpg`
 }
 
 export function LiveCaptureHub({
@@ -162,36 +193,41 @@ export function LiveCaptureHub({
   showEngineModal?: boolean
 }) {
   const { push } = useToast()
+  const { user } = useAuth()
   const { videoRef, webcameraError, webcameraReady, videoPlaying } = useWebcameraPreview()
-  const captureCanvasRef = React.useRef<HTMLCanvasElement | null>(null)
+  const { boxes, delegate, error: clientVisionError, fps, frameLabel, latencyMs, results, retry, status: clientVisionStatus } = useClientVision({
+    videoRef,
+  })
   const overlayCanvasRef = React.useRef<HTMLCanvasElement | null>(null)
-  const reconnectTimer = React.useRef<number | null>(null)
-  const pollTimer = React.useRef<number | null>(null)
-  const frameTimer = React.useRef<number | null>(null)
-  const socketRef = React.useRef<WebSocket | null>(null)
-  const connectSocketRef = React.useRef<() => void>(() => undefined)
-  const connectedRef = React.useRef(false)
-  const onStatusChangeRef = React.useRef(onStatusChange)
-  const shuttingDownRef = React.useRef(false)
-  const frameInFlightRef = React.useRef(false)
-  const lastFrameSentAtRef = React.useRef<number | null>(null)
-  const lastFrameReceivedAtRef = React.useRef<number | null>(null)
-  const rawFramePayloadRef = React.useRef<{ observations?: RawObservation[] } | null>(null)
-  const [snapshot, setSnapshot] = React.useState(FALLBACK_SNAPSHOT)
-  const [connected, setConnected] = React.useState(false)
-  const [isCopying, setIsCopying] = React.useState(false)
+  const snapshotWarmupTimeoutRef = React.useRef<number | null>(null)
+  const snapshotIntervalRef = React.useRef<number | null>(null)
+  const snapshotSessionStartedAtRef = React.useRef<number | null>(null)
+  const snapshotSessionActiveRef = React.useRef(false)
+  const snapshotCaptureInFlightRef = React.useRef(false)
   const [checklistOpen, setChecklistOpen] = React.useState(false)
-  const engineOverlayActive = showEngineModal && !connected
-  const reconnectCadenceSeconds = (ENGINE_RECONNECT_INTERVAL_MS / 1000).toFixed(1)
+
+  const clientVisionReady = clientVisionStatus === "live"
+  const clientVisionBooting = clientVisionStatus === "initializing" || clientVisionStatus === "idle"
+  const setupOverlayActive = showEngineModal && !clientVisionReady
+  const faceLandmarks = React.useMemo(
+    () => normalizeRenderableLandmarks([...(results.faceResults?.faceLandmarks[0] ?? [])], true),
+    [results.faceResults]
+  )
+  const poseLandmarks = React.useMemo(() => mutePoseFaceLandmarks([...(results.poseResults?.landmarks[0] ?? [])]), [results.poseResults])
+  const { leftHandLandmarks, rightHandLandmarks } = React.useMemo(() => partitionHandLandmarks(results.handResults), [results.handResults])
   const visibleLandmarks = React.useMemo(
     () =>
-      snapshot.landmarks.filter((landmark) => {
-        if (landmark.domain === "face") return landmark.landmarkIndex % 6 === 0
-        if (landmark.domain === "pose") return landmark.visibility == null || landmark.visibility > 0.35
-        return true
+      collectVisibleLandmarks({
+        faceLandmarks,
+        poseLandmarks,
+        leftHandLandmarks,
+        rightHandLandmarks,
       }),
-    [snapshot.landmarks]
+    [faceLandmarks, leftHandLandmarks, poseLandmarks, rightHandLandmarks]
   )
+  const runtimeLabel = delegate ? `MediaPipe ${delegate}` : "MediaPipe bootstrap"
+  const previewMessage = webcameraError || clientVisionError
+
   const operatorChecklistItems = React.useMemo(
     () => [
       {
@@ -199,93 +235,114 @@ export function LiveCaptureHub({
         ok: webcameraReady && !webcameraError,
       },
       {
-        label: "Verify the Docker engine is listening on port 8000.",
-        ok: connected,
+        label: "Verify the MediaPipe WebAssembly runtime has initialized in the browser.",
+        ok: clientVisionReady,
       },
       {
-        label: "Review the heads-up display boxes before beginning the scoring session.",
-        ok: connected && (snapshot.boxes.length > 0 || visibleLandmarks.length > 0),
+        label: "Review the heads-up display overlays before beginning the scoring session.",
+        ok: clientVisionReady && (boxes.length > 0 || visibleLandmarks.length > 0),
       },
     ],
-    [connected, snapshot.boxes.length, visibleLandmarks.length, webcameraError, webcameraReady]
+    [boxes.length, clientVisionReady, visibleLandmarks.length, webcameraError, webcameraReady]
   )
   const operatorChecklistReady = operatorChecklistItems.every((item) => item.ok)
 
   React.useEffect(() => {
-    connectedRef.current = connected
-  }, [connected])
-
-  React.useEffect(() => {
-    onStatusChangeRef.current = onStatusChange
-  }, [onStatusChange])
-
-  const scheduleReconnect = React.useCallback(() => {
-    if (reconnectTimer.current !== null) return
-    reconnectTimer.current = window.setTimeout(() => {
-      reconnectTimer.current = null
-      connectSocketRef.current()
-    }, ENGINE_RECONNECT_INTERVAL_MS)
-  }, [])
-
-  const stopFramePump = React.useCallback(() => {
-    if (frameTimer.current !== null) {
-      window.clearInterval(frameTimer.current)
-      frameTimer.current = null
-    }
-    frameInFlightRef.current = false
-  }, [])
-
-  const pumpFrame = React.useCallback(() => {
-    const socket = socketRef.current
-    const video = videoRef.current
-
-    if (!socket || socket.readyState !== WebSocket.OPEN || !video || video.readyState < 2 || video.videoWidth <= 0 || video.videoHeight <= 0) {
+    if (clientVisionReady) {
+      onStatusChange("live")
       return
     }
 
-    if (frameInFlightRef.current) return
-
-    const width = video.videoWidth || 1280
-    const height = video.videoHeight || 720
-
-    let canvas = captureCanvasRef.current
-    if (!canvas) {
-      canvas = document.createElement("canvas")
-      captureCanvasRef.current = canvas
+    if (clientVisionBooting || (webcameraReady && !webcameraError)) {
+      onStatusChange("standby")
+      return
     }
 
-    canvas.width = width
-    canvas.height = height
+    onStatusChange("offline")
+  }, [clientVisionBooting, clientVisionReady, onStatusChange, webcameraError, webcameraReady])
 
-    const context = canvas.getContext("2d")
-    if (!context) return
+  const clearSnapshotSchedule = React.useCallback(() => {
+    if (snapshotWarmupTimeoutRef.current !== null) {
+      window.clearTimeout(snapshotWarmupTimeoutRef.current)
+      snapshotWarmupTimeoutRef.current = null
+    }
 
-    context.drawImage(video, 0, 0, width, height)
-    frameInFlightRef.current = true
-    lastFrameSentAtRef.current = performance.now()
+    if (snapshotIntervalRef.current !== null) {
+      window.clearInterval(snapshotIntervalRef.current)
+      snapshotIntervalRef.current = null
+    }
+  }, [])
 
-    canvas.toBlob(
-      async (blob) => {
-        if (!blob) {
-          frameInFlightRef.current = false
-          return
-        }
+  const captureSnapshot = React.useCallback(async () => {
+    if (snapshotCaptureInFlightRef.current) {
+      return
+    }
 
-        try {
-          const bytes = await blob.arrayBuffer()
-          if (socketRef.current !== socket || socket.readyState !== WebSocket.OPEN) {
-            frameInFlightRef.current = false
-            return
-          }
-          socket.send(bytes)
-        } catch {
-          frameInFlightRef.current = false
-        }
-      },
-      "image/jpeg",
-      0.8
-    )
+    const video = videoRef.current
+    const overlayCanvas = overlayCanvasRef.current
+    const sessionStartedAt = snapshotSessionStartedAtRef.current
+
+    if (!video || !sessionStartedAt || video.videoWidth <= 0 || video.videoHeight <= 0) {
+      return
+    }
+
+    snapshotCaptureInFlightRef.current = true
+
+    try {
+      const blob = await renderCompositeSnapshotToJpegBlob(video, overlayCanvas)
+      if (!blob) {
+        return
+      }
+
+      const capturedAt = new Date().toISOString()
+      const offsetMs = Math.max(0, Date.now() - sessionStartedAt)
+
+      appendAnalyticsSnapshot({
+        capturedAt,
+        offsetMs,
+        fileName: formatSnapshotFileName(capturedAt, offsetMs),
+        blob,
+      })
+    } finally {
+      snapshotCaptureInFlightRef.current = false
+    }
   }, [videoRef])
+
+  React.useEffect(() => {
+    const video = videoRef.current
+    const sessionReady =
+      clientVisionReady && videoPlaying && Boolean(video) && (video?.videoWidth ?? 0) > 0 && (video?.videoHeight ?? 0) > 0
+
+    if (!sessionReady || snapshotSessionActiveRef.current) {
+      return
+    }
+
+    const startedAt = new Date().toISOString()
+    snapshotSessionStartedAtRef.current = Date.parse(startedAt)
+    snapshotSessionActiveRef.current = true
+    startAnalyticsCaptureSession(startedAt)
+
+    snapshotWarmupTimeoutRef.current = window.setTimeout(() => {
+      void captureSnapshot()
+      snapshotIntervalRef.current = window.setInterval(() => {
+        void captureSnapshot()
+      }, SNAPSHOT_INTERVAL_MS)
+    }, SNAPSHOT_WARMUP_MS)
+  }, [captureSnapshot, clientVisionReady, videoPlaying, videoRef])
+
+  React.useEffect(() => {
+    const video = videoRef.current
+    const sessionReady =
+      clientVisionReady && videoPlaying && Boolean(video) && (video?.videoWidth ?? 0) > 0 && (video?.videoHeight ?? 0) > 0
+
+    if (sessionReady || !snapshotSessionActiveRef.current) {
+      return
+    }
+
+    clearSnapshotSchedule()
+    snapshotSessionActiveRef.current = false
+    snapshotSessionStartedAtRef.current = null
+  }, [clearSnapshotSchedule, clientVisionReady, videoPlaying, videoRef])
 
   React.useEffect(() => {
     const canvas = overlayCanvasRef.current
@@ -313,176 +370,61 @@ export function LiveCaptureHub({
       canvas.height = height
     }
 
-    const payload = rawFramePayloadRef.current
     const canvasCtx = canvas.getContext("2d")
     if (!canvasCtx) return
 
     canvasCtx.save()
     canvasCtx.clearRect(0, 0, canvas.width, canvas.height)
 
-    if (!payload || !Array.isArray(payload.observations)) {
-      canvasCtx.restore()
-      return
+    if (faceLandmarks.length > 0) {
+      drawConnectors(canvasCtx, faceLandmarks, FACE_TESSELLATION_CONNECTIONS, FACE_TESSELLATION_STYLE)
+      drawLandmarks(canvasCtx, faceLandmarks, FACE_DOT_STYLE)
+      drawConnectors(canvasCtx, faceLandmarks, FACE_CONTOUR_CONNECTIONS, FACE_CONTOUR_STYLE)
     }
 
-    const uniqueTrackIds = Array.from(
-      new Set(payload.observations.map((observation) => observation.track_id).filter((trackId): trackId is string => typeof trackId === "string"))
-    )
+    if (poseLandmarks.length > 0) {
+      drawConnectors(canvasCtx, poseLandmarks, POSE_CONNECTIONS, POSE_CONNECTOR_STYLE)
+      drawLandmarks(canvasCtx, poseLandmarks, POSE_LANDMARK_STYLE)
+    }
 
-    uniqueTrackIds.forEach((trackId) => {
-      const { faceLandmarks, poseLandmarks, leftHandLandmarks, rightHandLandmarks, hasFace, hasPose, hasLeftHand, hasRightHand } =
-        rebuildTrackLandmarks(payload.observations ?? [], trackId, width, height)
+    leftHandLandmarks.forEach((landmarks) => {
+      drawHandOverlay(canvasCtx, landmarks)
+    })
 
-      if (hasFace) {
-        drawLandmarks(canvasCtx, faceLandmarks, FACE_DOT_STYLE)
-        FACE_CONTOUR_CONNECTIONS.forEach((contour) => {
-          const isValid = contour.every(
-            ([startIndex, endIndex]) => (faceLandmarks[startIndex]?.visibility ?? 0) > 0 && (faceLandmarks[endIndex]?.visibility ?? 0) > 0
-          )
-          if (isValid) {
-            drawConnectors(canvasCtx, faceLandmarks, contour, FACE_CONTOUR_STYLE)
-          }
-        })
-      }
-
-      if (hasPose) {
-        drawConnectors(canvasCtx, poseLandmarks, POSE_CONNECTIONS, POSE_CONNECTOR_STYLE)
-        drawLandmarks(canvasCtx, poseLandmarks, POSE_LANDMARK_STYLE)
-      }
-
-      if (hasLeftHand) {
-        drawHandOverlay(canvasCtx, leftHandLandmarks)
-      }
-
-      if (hasRightHand) {
-        drawHandOverlay(canvasCtx, rightHandLandmarks)
-      }
+    rightHandLandmarks.forEach((landmarks) => {
+      drawHandOverlay(canvasCtx, landmarks)
     })
 
     canvasCtx.restore()
-  }, [snapshot.fps, videoRef])
+  }, [faceLandmarks, leftHandLandmarks, poseLandmarks, rightHandLandmarks, videoRef])
 
-  const startFramePump = React.useCallback(() => {
-    if (frameTimer.current !== null) return
-    frameTimer.current = window.setInterval(() => {
-      pumpFrame()
-    }, 250)
-  }, [pumpFrame])
-
-  const runHealthPoll = React.useCallback(async () => {
-    try {
-      const response = await fetch(ENGINE_HEALTH_URL, { cache: "no-store" })
-      if (response.ok && !connectedRef.current) {
-        connectSocketRef.current()
-      }
-    } catch {
-      onStatusChangeRef.current("offline")
-    }
-  }, [])
-
-  React.useEffect(() => {
-    connectSocketRef.current = () => {
-      if (socketRef.current && socketRef.current.readyState <= WebSocket.OPEN) return
-
-      onStatusChangeRef.current("standby")
-
-      try {
-        const socket = new WebSocket(ENGINE_WEBSOCKET_URL)
-        socketRef.current = socket
-
-        socket.onopen = () => {
-          setConnected(true)
-          onStatusChangeRef.current("live")
-          startFramePump()
-        }
-
-        socket.onmessage = (event) => {
-          try {
-            const parsed = JSON.parse(event.data) as { type?: string; observations?: RawObservation[] }
-            if (parsed.type === "frame_result") {
-              rawFramePayloadRef.current = parsed
-            }
-            const now = performance.now()
-            const latencyMs = lastFrameSentAtRef.current ? Math.max(1, Math.round(now - lastFrameSentAtRef.current)) : snapshot.latencyMs
-            const fps =
-              lastFrameReceivedAtRef.current && now > lastFrameReceivedAtRef.current
-                ? Number((1000 / (now - lastFrameReceivedAtRef.current)).toFixed(1))
-                : snapshot.fps
-
-            lastFrameReceivedAtRef.current = now
-            frameInFlightRef.current = false
-            setSnapshot(readSnapshot(parsed, { fps, latencyMs }) || FALLBACK_SNAPSHOT)
-          } catch {
-            frameInFlightRef.current = false
-            setSnapshot(FALLBACK_SNAPSHOT)
-          }
-        }
-
-        socket.onerror = () => {
-          socket.close()
-        }
-
-        socket.onclose = () => {
-          socketRef.current = null
-          setConnected(false)
-          stopFramePump()
-          if (shuttingDownRef.current) return
-          onStatusChangeRef.current("offline")
-          scheduleReconnect()
-        }
-      } catch {
-        setConnected(false)
-        stopFramePump()
-        onStatusChangeRef.current("offline")
-        scheduleReconnect()
-      }
-    }
-  }, [scheduleReconnect, snapshot.fps, snapshot.latencyMs, startFramePump, stopFramePump])
-
-  React.useEffect(() => {
-    shuttingDownRef.current = false
-    connectSocketRef.current()
-
-    pollTimer.current = window.setInterval(() => {
-      void runHealthPoll()
-    }, 6000)
-
-    return () => {
-      shuttingDownRef.current = true
-      if (reconnectTimer.current !== null) window.clearTimeout(reconnectTimer.current)
-      if (pollTimer.current !== null) window.clearInterval(pollTimer.current)
-      stopFramePump()
-      socketRef.current?.close()
-    }
-  }, [runHealthPoll, stopFramePump])
-
-  React.useEffect(() => {
-    if (connected && webcameraReady) {
-      startFramePump()
-      return
-    }
-
-    stopFramePump()
-  }, [connected, startFramePump, stopFramePump, webcameraReady])
-
-  async function copyCommand() {
-    setIsCopying(true)
-    try {
-      await navigator.clipboard.writeText(ENGINE_DOCKER_COMMAND)
-      push({ title: "Launch command copied", detail: ENGINE_DOCKER_COMMAND, tone: "success" })
-    } catch {
-      push({ title: "Copy failed", detail: ENGINE_DOCKER_COMMAND, tone: "danger" })
-    } finally {
-      setIsCopying(false)
-    }
+  function retryClientVision() {
+    clearSnapshotSchedule()
+    snapshotSessionActiveRef.current = false
+    snapshotSessionStartedAtRef.current = null
+    retry()
+    push({
+      title: "Client vision restart requested",
+      detail: "MediaPipe Tasks are reloading in the browser.",
+      tone: "success",
+    })
   }
+
+  React.useEffect(() => {
+    return () => {
+      clearSnapshotSchedule()
+      snapshotSessionActiveRef.current = false
+      snapshotSessionStartedAtRef.current = null
+      void finalizeActiveCaptureSession(user?.id ?? null)
+    }
+  }, [clearSnapshotSchedule, user?.id])
 
   return (
     <>
       <Card className="relative overflow-hidden">
         <CardBody
           className={`grid items-start gap-6 pt-5 transition-[filter,opacity] duration-300 xl:grid-cols-[minmax(0,1fr)_360px] xl:items-stretch ${
-            engineOverlayActive ? "pointer-events-none select-none blur-xl opacity-35" : ""
+            setupOverlayActive ? "pointer-events-none select-none blur-xl opacity-35" : ""
           }`}
         >
           <div className="flex min-h-[640px] flex-col gap-6 xl:h-full">
@@ -493,10 +435,10 @@ export function LiveCaptureHub({
             <div className="glass-inset relative flex min-h-[420px] flex-1 flex-col overflow-hidden p-3">
               <div className="absolute left-5 top-5 z-20 flex gap-3">
                 <div className="glass-panel px-3 py-2 text-xs uppercase tracking-[0.24em] text-white/60">
-                  FPS <span className="ml-2 text-sm text-white">{snapshot.fps.toFixed(1)}</span>
+                  FPS <span className="ml-2 text-sm text-white">{fps.toFixed(1)}</span>
                 </div>
                 <div className="glass-panel px-3 py-2 text-xs uppercase tracking-[0.24em] text-white/60">
-                  Latency <span className="ml-2 text-sm text-white">{snapshot.latencyMs} ms</span>
+                  Latency <span className="ml-2 text-sm text-white">{latencyMs} ms</span>
                 </div>
               </div>
 
@@ -506,18 +448,18 @@ export function LiveCaptureHub({
                 <div className="absolute bottom-4 left-4 z-20 rounded-full bg-black/60 px-3 py-1 text-xs uppercase tracking-[0.2em] text-white/70">
                   WebCamera
                 </div>
-                {!videoPlaying && !webcameraError ? (
+                {!videoPlaying && !previewMessage ? (
                   <div className="absolute bottom-4 right-4 z-20 rounded-full bg-black/60 px-3 py-1 text-xs text-white/70">
                     {webcameraReady ? "Starting WebCamera preview..." : "Waiting for WebCamera permission..."}
                   </div>
                 ) : null}
-                {webcameraError ? (
+                {previewMessage ? (
                   <div className="absolute inset-x-6 bottom-6 z-30 rounded-[20px] border border-rose-300/20 bg-black/70 p-4 text-sm text-white/80 shadow-[0_20px_60px_rgba(0,0,0,0.4)] backdrop-blur-xl">
-                    {webcameraError}
+                    {previewMessage}
                   </div>
                 ) : null}
                 <div className="pointer-events-none absolute inset-0">
-                  {snapshot.boxes.map((box) => (
+                  {boxes.map((box) => (
                     <div
                       key={box.id}
                       className="absolute rounded-xl border border-accent-cyan/80 shadow-[0_0_18px_rgba(34,211,238,0.28)]"
@@ -529,7 +471,7 @@ export function LiveCaptureHub({
                       }}
                     >
                       <span className="absolute -top-7 left-0 rounded-full bg-black/70 px-2 py-1 text-xs text-white/80">
-                        {box.label}
+                        {boxes.length === 1 ? "Person 1" : box.label}
                       </span>
                     </div>
                   ))}
@@ -540,8 +482,8 @@ export function LiveCaptureHub({
 
           <div className="space-y-4 xl:w-[360px]">
             <div className="glass-inset flex items-center gap-3 px-4 py-3 text-sm text-white/65">
-              <span className={connected ? "status-dot-live" : "status-dot-down"} />
-              {connected ? "Streaming from engine" : "Waiting for engine"}
+              <span className={clientVisionReady ? "status-dot-live" : "status-dot-down"} />
+              {clientVisionReady ? "Streaming from client vision" : clientVisionBooting ? "Loading client vision" : "Client vision offline"}
             </div>
             <div className="flex w-full flex-col items-end gap-3">
               <button
@@ -569,24 +511,24 @@ export function LiveCaptureHub({
             </div>
             <div className="glass-inset p-4">
               <div className="text-xs uppercase tracking-[0.24em] text-white/45">Frame source</div>
-              <div className="mt-3 text-lg font-semibold">{connected ? snapshot.frameLabel : FALLBACK_SNAPSHOT.frameLabel}</div>
+              <div className="mt-3 text-lg font-semibold">{frameLabel}</div>
               <p className="mt-2 text-sm text-white/55">
-                The preview should stay visible even while the local engine is reconnecting or warming up.
+                The preview stays active while MediaPipe tasks initialize and browser inference warms up.
               </p>
             </div>
             <div className="glass-inset p-4">
-              <div className="text-xs uppercase tracking-[0.24em] text-white/45">Reconnect policy</div>
+              <div className="text-xs uppercase tracking-[0.24em] text-white/45">Runtime policy</div>
               <ul className="mt-3 space-y-3 text-sm text-white/65">
-                <li>WebSocket reconnect every {reconnectCadenceSeconds} seconds after disconnect.</li>
-                <li>Background health probe every 6 seconds against the local engine.</li>
-                <li>Overlay prompts the operator until the stream comes back online.</li>
+                <li>Inference follows the browser video clock and only processes fresh frames.</li>
+                <li>GPU delegation is attempted first and automatically falls back to CPU if the browser declines it.</li>
+                <li>Track IDs are maintained with centroid matching and pruned after brief visibility gaps.</li>
               </ul>
             </div>
             <div className="glass-inset p-4">
               <div className="text-xs uppercase tracking-[0.24em] text-white/45">Detection summary</div>
-              <div className="mt-3 space-y-2 text-sm text-white/70">
-                {snapshot.boxes.length > 0 ? (
-                  snapshot.boxes.map((box) => (
+                <div className="mt-3 space-y-2 text-sm text-white/70">
+                  {boxes.length > 0 ? (
+                  boxes.map((box) => (
                     <div key={box.id} className="flex items-center justify-between gap-3 rounded-glass bg-white/5 px-3 py-2">
                       <span>{box.label}</span>
                       <span className="text-white/40">
@@ -603,39 +545,37 @@ export function LiveCaptureHub({
               <div className="text-xs uppercase tracking-[0.24em] text-white/45">Holistic overlay</div>
               <div className="mt-3 text-sm text-white/65">
                 {visibleLandmarks.length > 0
-                  ? `${visibleLandmarks.length} landmark points rendered from MediaPipe holistic output.`
-                  : "No holistic landmark points rendered yet."}
+                  ? `${visibleLandmarks.length} landmark points rendered from client-side MediaPipe output (${poseLandmarks.length} pose, ${faceLandmarks.length} face, ${leftHandLandmarks.flat().length + rightHandLandmarks.flat().length} hands).`
+                  : "No client-side landmark points rendered yet."}
               </div>
             </div>
-            {!connected ? (
+            {!clientVisionReady ? (
               <div className="glass-inset space-y-3 p-4">
-                <div className="text-xs uppercase tracking-[0.24em] text-white/45">Engine status</div>
+                <div className="text-xs uppercase tracking-[0.24em] text-white/45">Vision status</div>
                 <p className="text-sm text-white/60">
-                  The local engine is offline. Use the launch command shown over the preview to bring detections online.
+                  The browser runtime is still warming up. Camera preview stays available while tasks initialize and tracks settle.
                 </p>
               </div>
             ) : null}
           </div>
         </CardBody>
-        {engineOverlayActive ? (
+        {setupOverlayActive ? (
           <div className="absolute inset-0 z-40 flex items-center justify-center bg-[rgba(3,5,10,0.84)] px-4 backdrop-blur-[22px]">
             <div className="w-full max-w-3xl border border-white/12 bg-[rgba(6,8,14,0.92)] shadow-[0_30px_120px_rgba(0,0,0,0.6)] glass-panel-strong ring-accent">
               <div className="px-6 pb-4 pt-6">
-                <div className="text-base font-semibold tracking-tight">Start local capture engine</div>
+                <div className="text-base font-semibold tracking-tight">Initialize client vision</div>
               </div>
               <div className="space-y-4 px-6 pb-6">
                 <p className="text-sm text-white/75">
-                  Bring the local engine online to unlock live detections and holistic overlays for capture. You can still move to the
-                  dashboard or analytics pages while this prompt stays active here.
+                  Grant camera access and let the browser load the MediaPipe WebAssembly tasks. The overlay closes automatically as soon as
+                  client-side tracking becomes live.
                 </p>
-                <div className="overflow-x-auto rounded-glass bg-black/30 p-4 font-mono text-sm text-white/85">
-                  {ENGINE_DOCKER_COMMAND}
-                </div>
+                <div className="overflow-x-auto rounded-glass bg-black/30 p-4 font-mono text-sm text-white/85">{runtimeLabel}</div>
                 <div className="flex flex-wrap items-center gap-3">
-                  <Button type="button" variant="primary" onClick={copyCommand} loading={isCopying}>
-                    Copy launch command
+                  <Button type="button" variant="primary" onClick={retryClientVision}>
+                    Retry initialization
                   </Button>
-                  <div className="text-sm text-white/45">This prompt closes automatically as soon as the local engine reconnects.</div>
+                  <div className="text-sm text-white/45">The retry action reboots the task bundle without leaving the capture page.</div>
                 </div>
               </div>
             </div>
