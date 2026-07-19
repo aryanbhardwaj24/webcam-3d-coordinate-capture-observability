@@ -1,28 +1,17 @@
 "use client"
 
 import * as React from "react"
-import JSZip from "jszip"
 
+import { useAuth } from "@/components/providers/AuthProvider"
+import {
+  analyticsDriftPoints,
+  analyticsThroughputPoints,
+  buildAnalyticsZipBundle,
+} from "@/lib/analytics/exportBundle"
+import { uploadZipToDrive } from "@/lib/google/drive"
 import { Button } from "@/components/ui/Button"
 import { Card, CardBody, CardDescription, CardHeader, CardTitle } from "@/components/ui/Card"
 import { useToast } from "@/components/ui/Toast"
-
-const throughputPoints = [42, 48, 51, 58, 61, 67, 69]
-const driftPoints = [8, 7, 7, 5, 4, 3, 3]
-const exportFiles = {
-  "analytics/session-summary.json": JSON.stringify(
-    {
-      generatedAt: "browser",
-      sessions: 14,
-      avgFps: 31.2,
-      calibrationDriftMm: 3.4,
-    },
-    null,
-    2
-  ),
-  "analytics/throughput.csv": "window,tracked_points\n08:00,42\n09:00,48\n10:00,51\n11:00,58\n12:00,61\n13:00,67\n14:00,69\n",
-  "analytics/drift.csv": "window,drift_mm\n08:00,8\n09:00,7\n10:00,7\n11:00,5\n12:00,4\n13:00,3\n14:00,3\n",
-}
 
 function sparkline(points: number[]) {
   const max = Math.max(...points)
@@ -41,26 +30,26 @@ function sparkline(points: number[]) {
 
 export function AnalyticsCenter() {
   const { push } = useToast()
+  const { hasSupabaseEnv, providerToken, recordArtifact, user } = useAuth()
   const [exporting, setExporting] = React.useState(false)
+  const [uploading, setUploading] = React.useState(false)
+  const [lastUploadName, setLastUploadName] = React.useState<string | null>(null)
+  const driveUploadReady = Boolean(providerToken)
 
   async function downloadZip() {
     setExporting(true)
 
     try {
-      const zip = new JSZip()
-      Object.entries(exportFiles).forEach(([path, contents]) => {
-        zip.file(path, contents)
-      })
-      const blob = await zip.generateAsync({ type: "blob" })
+      const { blob, fileCount, fileName } = await buildAnalyticsZipBundle()
       const url = URL.createObjectURL(blob)
       const anchor = document.createElement("a")
       anchor.href = url
-      anchor.download = "capture-analytics-bundle.zip"
+      anchor.download = fileName
       anchor.click()
       URL.revokeObjectURL(url)
       push({
         title: "ZIP export ready",
-        detail: "Downloaded analytics bundle in the browser using JSZip.",
+        detail: `Downloaded ${fileCount} analytics files in a browser-built ZIP bundle.`,
         tone: "success",
       })
     } catch (error) {
@@ -74,16 +63,86 @@ export function AnalyticsCenter() {
     }
   }
 
+  async function uploadBundleToDrive() {
+    if (!providerToken) {
+      push({
+        title: "Missing Google Authorization",
+        detail: "Please log in with Google to enable Drive uploads.",
+        tone: "danger",
+      })
+      return
+    }
+
+    if (uploading) {
+      return
+    }
+
+    setUploading(true)
+
+    try {
+      const { blob, fileCount, fileName, generatedAt } = await buildAnalyticsZipBundle()
+      const upload = await uploadZipToDrive({
+        accessToken: providerToken,
+        blob,
+        fileName,
+      })
+
+      if (hasSupabaseEnv && user) {
+        await recordArtifact({
+          fileName,
+          mimeType: "application/zip",
+          byteSize: blob.size,
+          driveFileId: upload.id,
+          driveWebViewLink: upload.webViewLink ?? null,
+          metadata: {
+            exportSource: "browser",
+            exportedFileCount: fileCount,
+            generatedAt,
+          },
+        })
+      }
+
+      setLastUploadName(upload.name)
+      push({
+        title: "Drive upload complete",
+        detail: upload.webViewLink ? `Opened ${upload.name} in Google Drive.` : `Uploaded ${upload.name} to Google Drive.`,
+        tone: "success",
+      })
+
+      if (upload.webViewLink) {
+        window.open(upload.webViewLink, "_blank", "noopener,noreferrer")
+      }
+    } catch (error) {
+      push({
+        title: "Drive upload failed",
+        detail: error instanceof Error ? error.message : "An unknown error occurred during upload.",
+        tone: "danger",
+      })
+    } finally {
+      setUploading(false)
+    }
+  }
+
   return (
     <Card>
       <CardHeader className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
         <div>
           <CardTitle>Analytics Center</CardTitle>
-          <CardDescription>Operator-ready stat cards, trend charts, and browser-side ZIP export with no server round trip.</CardDescription>
+          <CardDescription>
+            Operator-ready stat cards, trend charts, and browser-side ZIP export with direct upload to Google Drive.
+          </CardDescription>
+          <div className="mt-2 text-sm text-white/45">
+            {driveUploadReady ? "Google Drive upload is ready." : "Sign in with Google to enable Drive uploads."}
+          </div>
         </div>
-        <Button type="button" variant="primary" onClick={downloadZip} loading={exporting}>
-          Download ZIP bundle
-        </Button>
+        <div className="flex flex-wrap gap-3">
+          <Button type="button" variant="secondary" onClick={downloadZip} loading={exporting}>
+            Download ZIP bundle
+          </Button>
+          <Button type="button" variant="primary" onClick={uploadBundleToDrive} loading={uploading} disabled={!driveUploadReady || uploading}>
+            Upload ZIP to Drive
+          </Button>
+        </div>
       </CardHeader>
       <CardBody className="space-y-6">
         <div className="grid gap-4 md:grid-cols-4">
@@ -91,7 +150,7 @@ export function AnalyticsCenter() {
             ["Sessions", "14", "+3 today"],
             ["Avg capture FPS", "31.2", "Above target"],
             ["Calibration drift", "3.4 mm", "-1.1 mm"],
-            ["Export readiness", "98%", "All artifacts present"],
+            ["Drive state", lastUploadName ? "Synced" : driveUploadReady ? "Ready" : "Sign in required", lastUploadName || "Google session required"],
           ].map(([label, value, delta]) => (
             <div key={label} className="glass-inset p-4">
               <div className="text-xs uppercase tracking-[0.24em] text-white/45">{label}</div>
@@ -111,7 +170,7 @@ export function AnalyticsCenter() {
               <div className="rounded-full bg-emerald-400/12 px-3 py-1 text-xs text-emerald-200">Healthy</div>
             </div>
             <svg viewBox="0 0 240 64" className="mt-6 h-28 w-full">
-              <path d={sparkline(throughputPoints)} fill="none" stroke="rgba(34,211,238,0.95)" strokeWidth="3" />
+              <path d={sparkline(analyticsThroughputPoints)} fill="none" stroke="rgba(34,211,238,0.95)" strokeWidth="3" />
             </svg>
             <div className="mt-3 flex justify-between text-xs text-white/35">
               <span>08:00</span>
@@ -128,7 +187,7 @@ export function AnalyticsCenter() {
               <div className="rounded-full bg-accent-violet/15 px-3 py-1 text-xs text-violet-200">Improving</div>
             </div>
             <svg viewBox="0 0 240 64" className="mt-6 h-28 w-full">
-              <path d={sparkline(driftPoints)} fill="none" stroke="rgba(167,139,250,0.95)" strokeWidth="3" />
+              <path d={sparkline(analyticsDriftPoints)} fill="none" stroke="rgba(167,139,250,0.95)" strokeWidth="3" />
             </svg>
             <div className="mt-3 flex justify-between text-xs text-white/35">
               <span>08:00</span>
