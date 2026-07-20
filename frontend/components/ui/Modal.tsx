@@ -12,6 +12,7 @@ export function Modal({
   children,
   className,
   dismissible = true,
+  closeLabel = "Close",
 }: {
   open: boolean
   onClose: () => void
@@ -19,6 +20,7 @@ export function Modal({
   children: React.ReactNode
   className?: string
   dismissible?: boolean
+  closeLabel?: string
 }) {
   const [mounted, setMounted] = React.useState(false)
 
@@ -34,6 +36,19 @@ export function Modal({
     window.addEventListener("keydown", onKeyDown)
     return () => window.removeEventListener("keydown", onKeyDown)
   }, [dismissible, open, onClose])
+
+  React.useEffect(() => {
+    if (!open || typeof document === "undefined") return
+
+    const { body } = document
+    const previousOverflow = body.style.overflow
+
+    body.style.overflow = "hidden"
+
+    return () => {
+      body.style.overflow = previousOverflow
+    }
+  }, [open])
 
   if (!mounted || !open) return null
 
@@ -53,11 +68,11 @@ export function Modal({
           {dismissible ? (
             <button
               type="button"
-              aria-label="Close"
-              className="rounded-glass bg-white/5 px-3 py-2 text-sm text-white/70 hover:bg-white/10 hover:text-white"
+              aria-label={closeLabel}
+              className="rounded-glass bg-white/5 px-3 py-2 text-lg leading-none text-white/70 hover:bg-white/10 hover:text-white"
               onClick={onClose}
             >
-              Esc
+              &times;
             </button>
           ) : null}
         </div>
