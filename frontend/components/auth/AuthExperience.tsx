@@ -3,12 +3,73 @@
 import { useRouter } from "next/navigation"
 import * as React from "react"
 
+import {
+  parsePendingVerificationState,
+  pendingVerificationEmailCookie,
+  pendingVerificationResendAtCookie,
+  type PendingVerificationState,
+  verificationResendCooldownMs,
+} from "@/lib/auth/pendingVerification"
 import { getSupabaseBrowserClient } from "@/lib/supabase/browser"
 import { hasSupabaseEnv } from "@/lib/supabase/env"
 import { Button } from "@/components/ui/Button"
 import { Card, CardBody, CardDescription, CardHeader, CardTitle } from "@/components/ui/Card"
 import { Input } from "@/components/ui/Input"
 import { useToast } from "@/components/ui/Toast"
+
+function extractAuthErrorDetail(error: unknown, fallback: string) {
+  if (error instanceof Error) {
+    const message = error.message?.trim()
+    if (message && message !== "{}") {
+      return message
+    }
+  }
+
+  if (typeof error === "string") {
+    const message = error.trim()
+    if (message && message !== "{}") {
+      return message
+    }
+  }
+
+  if (error && typeof error === "object") {
+    const candidate = error as {
+      message?: unknown
+      msg?: unknown
+      error_description?: unknown
+      error?: unknown
+      code?: unknown
+      status?: unknown
+    }
+
+    const possibleMessages = [
+      candidate.message,
+      candidate.msg,
+      candidate.error_description,
+      candidate.error,
+    ]
+
+    for (const possibleMessage of possibleMessages) {
+      if (typeof possibleMessage === "string") {
+        const message = possibleMessage.trim()
+        if (message && message !== "{}") {
+          return message
+        }
+      }
+    }
+
+    try {
+      const serialized = JSON.stringify(error)
+      if (serialized && serialized !== "{}") {
+        return serialized
+      }
+    } catch {
+      // Ignore serialization failures and fall back to the caller-provided message.
+    }
+  }
+
+  return fallback
+}
 
 function EyeIcon({ crossed }: { crossed: boolean }) {
   return (
@@ -85,8 +146,49 @@ export function AuthExperience({
   const [form, setForm] = React.useState({ email: "", password: "", confirmPassword: "" })
   const [submitting, setSubmitting] = React.useState(false)
   const [googleLoading, setGoogleLoading] = React.useState(false)
+  const [resendingVerification, setResendingVerification] = React.useState(false)
   const [showPassword, setShowPassword] = React.useState(false)
   const [showConfirmPassword, setShowConfirmPassword] = React.useState(false)
+  const [pendingVerification, setPendingVerification] = React.useState<PendingVerificationState | null>(null)
+  const [resendCountdownNow, setResendCountdownNow] = React.useState(() => Date.now())
+
+  const refreshPendingVerification = React.useCallback(() => {
+    if (typeof document === "undefined") return
+    setPendingVerification(parsePendingVerificationState(document.cookie))
+  }, [])
+
+  React.useEffect(() => {
+    refreshPendingVerification()
+  }, [refreshPendingVerification])
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return
+
+    function syncPendingVerificationFromCookies() {
+      refreshPendingVerification()
+    }
+
+    window.addEventListener("focus", syncPendingVerificationFromCookies)
+    document.addEventListener("visibilitychange", syncPendingVerificationFromCookies)
+
+    return () => {
+      window.removeEventListener("focus", syncPendingVerificationFromCookies)
+      document.removeEventListener("visibilitychange", syncPendingVerificationFromCookies)
+    }
+  }, [refreshPendingVerification])
+
+  React.useEffect(() => {
+    if (!pendingVerification) return
+    if (pendingVerification.resendAvailableAt <= Date.now()) return
+
+    const intervalId = window.setInterval(() => {
+      setResendCountdownNow(Date.now())
+    }, 1000)
+
+    return () => {
+      window.clearInterval(intervalId)
+    }
+  }, [pendingVerification])
 
   React.useEffect(() => {
     if (initialError === "missing_supabase_env") {
@@ -101,6 +203,83 @@ export function AuthExperience({
   function updateField(event: React.ChangeEvent<HTMLInputElement>) {
     const { name, value } = event.target
     setForm((current) => ({ ...current, [name]: value }))
+  }
+
+  function persistPendingVerification(email: string, resendAvailableAt = Date.now() + verificationResendCooldownMs) {
+    if (typeof document === "undefined") return
+
+    const normalizedEmail = email.trim().toLowerCase()
+    const maxAgeSeconds = 60 * 60 * 24
+
+    document.cookie = `${pendingVerificationEmailCookie}=${encodeURIComponent(normalizedEmail)}; Max-Age=${maxAgeSeconds}; Path=/; SameSite=Lax`
+    document.cookie = `${pendingVerificationResendAtCookie}=${encodeURIComponent(String(resendAvailableAt))}; Max-Age=${maxAgeSeconds}; Path=/; SameSite=Lax`
+    setPendingVerification({
+      email: normalizedEmail,
+      resendAvailableAt,
+    })
+    setResendCountdownNow(Date.now())
+  }
+
+  function clearPendingVerification() {
+    if (typeof document === "undefined") return
+
+    document.cookie = `${pendingVerificationEmailCookie}=; Max-Age=0; Path=/; SameSite=Lax`
+    document.cookie = `${pendingVerificationResendAtCookie}=; Max-Age=0; Path=/; SameSite=Lax`
+    setPendingVerification(null)
+    setResendCountdownNow(Date.now())
+  }
+
+  function buildEmailRedirectTo() {
+    return `${window.location.origin}/auth/callback?next=${encodeURIComponent(nextPath)}`
+  }
+
+  function formatCountdown(msRemaining: number) {
+    const totalSeconds = Math.max(0, Math.ceil(msRemaining / 1000))
+    const minutes = Math.floor(totalSeconds / 60)
+    const seconds = totalSeconds % 60
+    return `${minutes}:${seconds.toString().padStart(2, "0")}`
+  }
+
+  async function resendVerificationEmail(email: string) {
+    if (!hasSupabaseEnv) {
+      push({
+        title: "Missing auth env",
+        detail: "Set NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY to enable Supabase auth.",
+        tone: "danger",
+      })
+      return
+    }
+
+    setResendingVerification(true)
+
+    try {
+      const supabase = getSupabaseBrowserClient()
+      const { error } = await supabase.auth.resend({
+        type: "signup",
+        email,
+        options: {
+          emailRedirectTo: buildEmailRedirectTo(),
+        },
+      })
+
+      if (error) throw error
+
+      persistPendingVerification(email)
+      push({
+        title: "Verification email sent",
+        detail: "A fresh confirmation link is on its way. Please check your inbox and spam folder.",
+        tone: "success",
+      })
+    } catch (error) {
+      console.error("Supabase resend verification error", error)
+      push({
+        title: "Could not resend verification email",
+        detail: extractAuthErrorDetail(error, "We could not resend the verification email right now."),
+        tone: "danger",
+      })
+    } finally {
+      setResendingVerification(false)
+    }
   }
 
   async function onEmailSubmit(event: React.FormEvent<HTMLFormElement>) {
@@ -135,8 +314,25 @@ export function AuthExperience({
           password: form.password,
         })
 
-        if (error) throw error
+        if (error) {
+          const normalizedMessage = error.message.toLowerCase()
+          const emailMatchesPendingVerification =
+            pendingVerification !== null && pendingVerification.email === form.email.trim().toLowerCase()
 
+          if (normalizedMessage.includes("email not confirmed") || emailMatchesPendingVerification) {
+            push({
+              title: "Verify your email first",
+              detail: "Please confirm your email address before signing in. You can resend the verification link below if needed.",
+              tone: "danger",
+            })
+
+            return
+          }
+
+          throw error
+        }
+
+        clearPendingVerification()
         push({
           title: "Signed in",
           detail: "Supabase session is active for the operator console.",
@@ -147,7 +343,7 @@ export function AuthExperience({
         return
       }
 
-      const redirectTo = `${window.location.origin}/auth/callback?next=${encodeURIComponent(nextPath)}`
+      const redirectTo = buildEmailRedirectTo()
       const { error } = await supabase.auth.signUp({
         email: form.email,
         password: form.password,
@@ -158,23 +354,37 @@ export function AuthExperience({
 
       if (error) throw error
 
+      persistPendingVerification(form.email.trim())
       push({
         title: "Check your inbox",
-        detail: "Supabase created the account. Email confirmation may still be required before the first sign-in.",
+        detail: "Your account was created. Please confirm your email address from the verification email before signing in, and check your spam folder if it does not appear right away.",
         tone: "success",
       })
       setForm((current) => ({ ...current, password: "", confirmPassword: "" }))
       setMode("sign-in")
     } catch (error) {
+      console.error("Supabase email auth error", error)
       push({
         title: mode === "sign-in" ? "Sign-in failed" : "Sign-up failed",
-        detail: error instanceof Error ? error.message : "Unknown Supabase auth error",
+        detail: extractAuthErrorDetail(
+          error,
+          mode === "sign-in"
+            ? "We could not sign you in right now."
+            : "We could not create your account right now. Please check the Supabase email settings and try again."
+        ),
         tone: "danger",
       })
     } finally {
       setSubmitting(false)
     }
   }
+
+  const normalizedFormEmail = form.email.trim().toLowerCase()
+  const matchesPendingVerificationEmail = pendingVerification?.email === normalizedFormEmail
+  const resendMsRemaining = pendingVerification
+    ? Math.max(0, pendingVerification.resendAvailableAt - resendCountdownNow)
+    : 0
+  const canResendVerification = matchesPendingVerificationEmail && resendMsRemaining <= 0
 
   async function onGoogleClick() {
     if (!hasSupabaseEnv) {
@@ -190,7 +400,7 @@ export function AuthExperience({
 
     try {
       const supabase = getSupabaseBrowserClient()
-      const redirectTo = `${window.location.origin}/auth/callback?next=${encodeURIComponent(nextPath)}`
+      const redirectTo = buildEmailRedirectTo()
       const { error } = await supabase.auth.signInWithOAuth({
         provider: "google",
         options: {
@@ -205,12 +415,13 @@ export function AuthExperience({
 
       if (error) throw error
     } catch (error) {
+      console.error("Supabase Google sign-in error", error)
       push({
         title: "Google sign-in failed",
-        detail:
-          error instanceof Error
-            ? error.message
-            : "Enable the Google provider in Supabase and allow this frontend origin for OAuth redirects.",
+        detail: extractAuthErrorDetail(
+          error,
+          "Enable the Google provider in Supabase and allow this frontend origin for OAuth redirects."
+        ),
         tone: "danger",
       })
       setGoogleLoading(false)
@@ -310,6 +521,33 @@ export function AuthExperience({
               <Button type="submit" variant="primary" size="lg" className="w-full" loading={submitting}>
                 {mode === "sign-in" ? "Sign in" : "Create account"}
               </Button>
+              {mode === "sign-in" && matchesPendingVerificationEmail ? (
+                <div className="rounded-glass border border-white/10 bg-white/5 p-4 text-sm text-white/70">
+                  <div className="font-medium text-white/85">Waiting for email confirmation</div>
+                  <div className="mt-2">
+                    Please confirm your email address before signing in. Supabase allows another verification email after 60 seconds, and this box will clear as soon as your confirmation is completed.
+                  </div>
+                  <div className="mt-3 space-y-2">
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => void resendVerificationEmail(normalizedFormEmail)}
+                      loading={resendingVerification}
+                      disabled={!canResendVerification || resendingVerification}
+                    >
+                      Resend verification email
+                    </Button>
+                    {!canResendVerification ? (
+                      <div className="text-xs text-white/50">
+                        You can resend the verification email in {formatCountdown(resendMsRemaining)}.
+                      </div>
+                    ) : (
+                      <div className="text-xs text-white/50">You can request a fresh verification email now.</div>
+                    )}
+                  </div>
+                </div>
+              ) : null}
             </form>
 
             <div className="flex items-center gap-3 text-xs uppercase tracking-[0.28em] text-white/35">

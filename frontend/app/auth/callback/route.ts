@@ -1,5 +1,9 @@
 import { NextResponse } from "next/server"
 
+import {
+  pendingVerificationEmailCookie,
+  pendingVerificationResendAtCookie,
+} from "@/lib/auth/pendingVerification"
 import { hasSupabaseEnv } from "@/lib/supabase/env"
 import { createSupabaseServerClient } from "@/lib/supabase/server"
 
@@ -21,5 +25,12 @@ export async function GET(request: Request) {
     await supabase.auth.exchangeCodeForSession(code)
   }
 
-  return NextResponse.redirect(redirectUrl)
+  const response = NextResponse.redirect(redirectUrl)
+
+  if (code) {
+    response.cookies.delete(pendingVerificationEmailCookie)
+    response.cookies.delete(pendingVerificationResendAtCookie)
+  }
+
+  return response
 }

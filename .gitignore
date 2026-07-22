@@ -1,0 +1,40 @@
+# OS and editor artifacts
+.DS_Store
+.vscode/
+.idea/
+
+# Local runtime and debug output
+.dbg/
+*.log
+
+# Node.js and Next.js build output
+node_modules/
+.next/
+out/
+
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Deployment metadata
+.vercel/
+
+# Local environment files and secrets
+.env
+.env.local
+.env.*.local
+/backend/.env
+/frontend/.env.local
+/research_engine/backend/.env
+!.env.example
+!.env.local.example
+!/research_engine/backend/.env.example
+!/frontend/.env.local.example
+
+# Local-only working copies not part of rewritten history
+/backend/
