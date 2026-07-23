@@ -23,6 +23,7 @@ type ArtifactRecordInput = {
 }
 
 type AuthContextValue = {
+  connectGoogleDrive: () => Promise<void>
   hasSupabaseEnv: boolean
   loading: boolean
   operatorSessionId: string | null
@@ -199,6 +200,44 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await syncProfile(user)
   }, [syncProfile, user])
 
+  const connectGoogleDrive = React.useCallback(async () => {
+    if (!hasSupabaseEnv) {
+      throw new Error("Set the Supabase frontend environment variables before connecting Google Drive.")
+    }
+
+    const supabase = getSupabaseBrowserClient()
+    const redirectTo = typeof window !== "undefined" ? `${window.location.origin}/auth/callback?next=/analytics` : undefined
+    const hasGoogleIdentity = Boolean(user?.identities?.some((identity) => identity.provider === "google"))
+
+    const { error } = hasGoogleIdentity
+      ? await supabase.auth.signInWithOAuth({
+          provider: "google",
+          options: {
+            redirectTo,
+            scopes: "https://www.googleapis.com/auth/drive.file",
+            queryParams: {
+              access_type: "offline",
+              prompt: "consent",
+            },
+        },
+        })
+      : await supabase.auth.linkIdentity({
+          provider: "google",
+          options: {
+            redirectTo,
+            scopes: "https://www.googleapis.com/auth/drive.file",
+            queryParams: {
+              access_type: "offline",
+              prompt: "consent",
+            },
+          },
+        })
+
+    if (error) {
+      throw error
+    }
+  }, [user])
+
   const signOut = React.useCallback(async () => {
     if (!hasSupabaseEnv) return
     if (user) {
@@ -233,6 +272,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const value = React.useMemo<AuthContextValue>(
     () => ({
+      connectGoogleDrive,
       hasSupabaseEnv,
       loading,
       operatorSessionId,
@@ -244,7 +284,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       refreshProfile,
       signOut,
     }),
-    [loading, operatorSessionId, profile, recordArtifact, refreshProfile, session, signOut, user]
+    [connectGoogleDrive, loading, operatorSessionId, profile, recordArtifact, refreshProfile, session, signOut, user]
   )
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>
