@@ -12,7 +12,7 @@ Entry-level portfolio project built to production-grade standards: a browser-bas
 
 ## Video Demonstration
 
-<video src="./docs/media/webcam-3d-coordinate-capture-demo.mp4" width="100%" controls muted playsinline></video>
+https://github.com/user-attachments/assets/5542bd0a-ea29-43be-ab9a-b37f306645d7
 
 > **Note:** This walkthrough demonstrates the complete end-to-end system:
 >
